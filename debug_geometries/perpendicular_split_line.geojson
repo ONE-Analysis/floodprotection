@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "perpendicular_split_line",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::6539" } },
+"features": [
+{ "type": "Feature", "properties": { }, "geometry": { "type": "LineString", "coordinates": [ [ 975490.068299015285447, 183001.70601750802598 ], [ 996001.605282400967553, 187087.964007781032706 ] ] } }
+]
+}

@@ -8,364 +8,252 @@ import rasterio
 from rasterio.mask import mask
 import numpy as np
 from pathlib import Path
-import ezdxf
 import shapely.geometry as sg
 from shapely.ops import linemerge
 from config import DATASET_INFO, PROJECT_CRS, OVERWRITE
-
-def cad_to_geojson(cad_path, geojson_path, as_polygon=False, join_segments=False):
-    """
-    Convert a CAD file (DXF or DWG) to GeoJSON
-    
-    Parameters:
-    cad_path (Path): Path to the CAD file (DXF or DWG)
-    geojson_path (Path): Path to save the GeoJSON output
-    as_polygon (bool): Whether to convert lines to closed polygons
-    join_segments (bool): Whether to join line segments into a single line
-    
-    Returns:
-    Path: Path to the created GeoJSON file
-    """
-    print(f"Converting {cad_path.name} to GeoJSON...")
-    print(f"CAD file will be assigned CRS: {PROJECT_CRS}")
-    
-    # Read CAD file using ezdxf
-    try:
-        doc = ezdxf.readfile(str(cad_path))
-        msp = doc.modelspace()
-        
-        # Extract geometries
-        geometries = []
-        for entity in msp:
-            if entity.dxftype() == 'LINE':
-                line = sg.LineString([(entity.dxf.start[0], entity.dxf.start[1]), 
-                                    (entity.dxf.end[0], entity.dxf.end[1])])
-                geometries.append(line)
-            elif entity.dxftype() == 'POLYLINE' or entity.dxftype() == 'LWPOLYLINE':
-                try:
-                    points = [(vertex.dxf.location[0], vertex.dxf.location[1]) for vertex in entity.vertices]
-                    if len(points) >= 2:
-                        if entity.is_closed:
-                            geometries.append(sg.Polygon(points))
-                        else:
-                            geometries.append(sg.LineString(points))
-                except Exception as e:
-                    print(f"Error processing polyline: {e}")
-                    
-        # Handle other entity types (like splines, arcs, etc.)
-        for entity in msp:
-            if entity.dxftype() == 'ARC':
-                try:
-                    # Convert arc to a series of points
-                    center = (entity.dxf.center[0], entity.dxf.center[1])
-                    radius = entity.dxf.radius
-                    start_angle = entity.dxf.start_angle
-                    end_angle = entity.dxf.end_angle
-                    
-                    # Handle angle wrapping
-                    if end_angle < start_angle:
-                        end_angle += 360
-                    
-                    # Create points along the arc
-                    num_points = max(10, int((end_angle - start_angle) / 5))  # One point every 5 degrees at least
-                    angles = [start_angle + (end_angle - start_angle) * i / (num_points - 1) for i in range(num_points)]
-                    points = [(center[0] + radius * np.cos(np.radians(a)), center[1] + radius * np.sin(np.radians(a))) for a in angles]
-                    
-                    geometries.append(sg.LineString(points))
-                except Exception as e:
-                    print(f"Error processing arc: {e}")
-            
-            elif entity.dxftype() == 'CIRCLE':
-                try:
-                    # Convert circle to a polygon
-                    center = (entity.dxf.center[0], entity.dxf.center[1])
-                    radius = entity.dxf.radius
-                    
-                    # Create points around the circle
-                    num_points = 36  # One point every 10 degrees
-                    angles = [i * 360 / num_points for i in range(num_points)]
-                    points = [(center[0] + radius * np.cos(np.radians(a)), center[1] + radius * np.sin(np.radians(a))) for a in angles]
-                    points.append(points[0])  # Close the ring
-                    
-                    geometries.append(sg.Polygon(points))
-                except Exception as e:
-                    print(f"Error processing circle: {e}")
-        
-        # Debug information
-        print(f"Found {len(geometries)} geometries in CAD file")
-        for i, geom in enumerate(geometries):
-            print(f"  Geometry {i+1}: {geom.geom_type} with {len(list(geom.coords)) if geom.geom_type in ['LineString', 'LinearRing'] else 'N/A'} points")
-        
-        # Join segments if requested
-        if join_segments and geometries:
-            try:
-                # Filter for line segments only
-                lines = [g for g in geometries if isinstance(g, sg.LineString)]
-                print(f"Found {len(lines)} line segments to join")
-                
-                if lines:
-                    # Use shapely's linemerge to join line segments
-                    merged_line = linemerge(lines)
-                    print(f"Merged lines type: {type(merged_line)}")
-                    
-                    # Handle both single LineString and MultiLineString results
-                    if isinstance(merged_line, sg.LineString):
-                        geometries = [merged_line]
-                    elif isinstance(merged_line, sg.MultiLineString):
-                        # If we got a multilinestring, keep the longest component
-                        longest = max(merged_line.geoms, key=lambda line: line.length)
-                        print(f"Keeping longest line segment of length {longest.length}")
-                        geometries = [longest]
-                    else:
-                        print(f"Unexpected type after linemerge: {type(merged_line)}")
-            except Exception as e:
-                print(f"Error joining segments: {e}")
-        
-        # Convert to polygon if requested
-        if as_polygon and geometries:
-            # Attempt to create a polygon from the lines
-            lines = [g for g in geometries if isinstance(g, sg.LineString)]
-            if lines:
-                try:
-                    # Create a closed polygon from the merged lines
-                    closed_line = linemerge(lines)
-                    if not closed_line.is_closed:
-                        # If not closed, add a segment to close it
-                        points = list(closed_line.coords)
-                        if points[0] != points[-1]:
-                            points.append(points[0])
-                        closed_line = sg.LineString(points)
-                    
-                    # Create a polygon from the closed line
-                    polygon = sg.Polygon(closed_line)
-                    geometries = [polygon]
-                except Exception as e:
-                    print(f"Error creating polygon: {e}")
-        
-        # Create GeoDataFrame
-        if not geometries:
-            print("Warning: No geometries found in the CAD file!")
-            # Create a placeholder point to avoid empty GeoDataFrame
-            geometries = [sg.Point(0, 0)]
-        
-        # Explicitly assign the PROJECT_CRS to the geometries
-        gdf = gpd.GeoDataFrame(geometry=geometries, crs=PROJECT_CRS)
-        
-        # Save to GeoJSON with explicit CRS
-        gdf.to_file(geojson_path, driver='GeoJSON')
-        print(f"Saved GeoJSON to {geojson_path} with CRS: {gdf.crs}")
-        
-        # Also save the bounds for debugging
-        bounds = gdf.total_bounds
-        print(f"Geometry bounds in {gdf.crs}: [{bounds[0]}, {bounds[1]}, {bounds[2]}, {bounds[3]}]")
-        
-    except Exception as e:
-        print(f"Error converting CAD file: {e}")
-        # Create an empty GeoDataFrame and save it
-        gdf = gpd.GeoDataFrame(geometry=[sg.Point(0, 0)], crs=PROJECT_CRS)
-        gdf.to_file(geojson_path, driver='GeoJSON')
-        print(f"Created empty GeoJSON file at {geojson_path}")
-    
-    return geojson_path
+import sys
+from rasterio.windows import from_bounds
 
 def create_site_bounds():
     """
-    Create Site_Bounds.geojson from Site_Bounds.dxf if needed
+    Load site_boundary.geojson
     
     Returns:
     GeoDataFrame: Site bounds as a GeoDataFrame
     """
-    site_bounds_path = DATASET_INFO["Input"]["Site_Bounds_GeoJSON"]["path"]
+    site_bounds_path = DATASET_INFO["Input"]["Site_Bounds"]["path"]
     
-    # Check if Site_Bounds.geojson already exists
-    if os.path.exists(site_bounds_path) and not OVERWRITE["site_bounds"]:
-        print(f"Site bounds already exists at {site_bounds_path}")
-        site_bbox = gpd.read_file(site_bounds_path)
-        # Ensure CRS is set correctly
-        if site_bbox.crs is None:
-            print(f"Site bounds has no CRS, assigning {PROJECT_CRS}")
-            site_bbox.crs = PROJECT_CRS
-        elif site_bbox.crs != PROJECT_CRS:
-            print(f"Converting site bounds from {site_bbox.crs} to {PROJECT_CRS}")
-            site_bbox = site_bbox.to_crs(PROJECT_CRS)
-        return site_bbox
+    if not os.path.exists(site_bounds_path):
+        raise FileNotFoundError(f"Site bounds not found at {site_bounds_path}")
     
-    # Otherwise, create from DXF
-    print("Creating site bounds from DXF...")
-    cad_path = DATASET_INFO["Input"]["Site_Bounds"]["path"]
-    
-    if not os.path.exists(cad_path):
-        raise FileNotFoundError(f"Site_Bounds.dxf not found at {cad_path}")
-    
-    # Convert DXF to GeoJSON, creating a closed polygon
-    cad_to_geojson(cad_path, site_bounds_path, as_polygon=True)
-    
-    # Load the created GeoJSON with explicit CRS
+    print(f"Loading site bounds from {site_bounds_path}")
     site_bbox = gpd.read_file(site_bounds_path)
+    
+    # Ensure CRS is set correctly
     if site_bbox.crs is None:
-        print(f"Setting CRS to {PROJECT_CRS} for site bounds")
+        print(f"Site bounds has no CRS, assigning {PROJECT_CRS}")
         site_bbox.crs = PROJECT_CRS
+    elif site_bbox.crs != PROJECT_CRS:
+        print(f"Converting site bounds from {site_bbox.crs} to {PROJECT_CRS}")
+        site_bbox = site_bbox.to_crs(PROJECT_CRS)
     
     return site_bbox
 
 def create_alignment():
     """
-    Create alignment.geojson from alignment.dxf if needed
+    Load alignment.geojson
     
     Returns:
     GeoDataFrame: Alignment as a GeoDataFrame
     """
-    alignment_path = DATASET_INFO["Input"]["Alignment_GeoJSON"]["path"]
+    alignment_path = DATASET_INFO["Input"]["Alignment"]["path"]
     
-    # Check if alignment.geojson already exists
-    regenerate = False
-    if os.path.exists(alignment_path) and not OVERWRITE["alignment"]:
-        print(f"Alignment already exists at {alignment_path}")
-        alignment = gpd.read_file(alignment_path)
-        
-        # Always ensure the alignment has the correct CRS
-        if alignment.crs is None:
-            print(f"Alignment has no CRS, assigning {PROJECT_CRS}")
-            alignment.crs = PROJECT_CRS
-            alignment.to_file(alignment_path, driver='GeoJSON')
-        elif alignment.crs != PROJECT_CRS:
-            print(f"Converting alignment from {alignment.crs} to {PROJECT_CRS}")
-            alignment = alignment.to_crs(PROJECT_CRS)
-            alignment.to_file(alignment_path, driver='GeoJSON')
-        
-        # Check if the alignment is empty and regenerate if needed
-        if alignment.empty:
-            print("Existing alignment GeoJSON is empty! Regenerating from DXF...")
-            regenerate = True
-        else:
-            return alignment
-    else:
-        regenerate = True
+    if not os.path.exists(alignment_path):
+        raise FileNotFoundError(f"Alignment not found at {alignment_path}")
     
-    # Regenerate from DXF
-    if regenerate:
-        print("Creating alignment from DXF...")
-        cad_path = DATASET_INFO["Input"]["Alignment"]["path"]
+    print(f"Loading alignment from {alignment_path}")
+    alignment = gpd.read_file(alignment_path)
+    
+    # Ensure CRS is set correctly
+    if alignment.crs is None:
+        print(f"Alignment has no CRS, assigning {PROJECT_CRS}")
+        alignment.crs = PROJECT_CRS
+    elif alignment.crs != PROJECT_CRS:
+        print(f"Converting alignment from {alignment.crs} to {PROJECT_CRS}")
+        alignment = alignment.to_crs(PROJECT_CRS)
+    
+    # Check if the alignment is empty
+    if alignment.empty:
+        print("ERROR: Alignment GeoJSON is empty!")
+        print("Please ensure your alignment file contains valid geometries.")
         
-        if not os.path.exists(cad_path):
-            raise FileNotFoundError(f"alignment.dxf not found at {cad_path}")
-        
-        # Check if file exists but force regeneration by setting OVERWRITE explicitly
-        force_overwrite_save = OVERWRITE["alignment"]
-        OVERWRITE["alignment"] = True
-        
-        # Convert DXF to GeoJSON, joining all segments into a single polyline
-        cad_to_geojson(cad_path, alignment_path, as_polygon=False, join_segments=True)
-        
-        # Restore original overwrite setting
-        OVERWRITE["alignment"] = force_overwrite_save
-        
-        # Load the created GeoJSON with explicit CRS
-        alignment = gpd.read_file(alignment_path)
-        if alignment.crs is None:
-            print(f"Setting CRS to {PROJECT_CRS} for alignment")
-            alignment.crs = PROJECT_CRS
-            alignment.to_file(alignment_path, driver='GeoJSON')
-        
-        # Check if still empty after regeneration - this is a critical error
-        if alignment.empty:
-            print("ERROR: Alignment is still empty after regeneration!")
-            print("Please check your DXF file to ensure it contains valid geometries.")
-            
-            # Create a placeholder line for debugging
-            # This is just for testing and should be removed in production
-            print("Creating placeholder alignment line for testing...")
-            # Get the bounds of the site
-            site_bounds_path = DATASET_INFO["Input"]["Site_Bounds_GeoJSON"]["path"]
-            if os.path.exists(site_bounds_path):
-                site_bbox = gpd.read_file(site_bounds_path)
-                if not site_bbox.empty:
-                    bounds = site_bbox.total_bounds
-                    # Create a line that crosses the site
-                    from shapely.geometry import LineString
-                    line = LineString([
-                        ((bounds[0] + bounds[2]) / 2, bounds[1]),  # Bottom middle
-                        ((bounds[0] + bounds[2]) / 2, bounds[3])   # Top middle
-                    ])
-                    alignment = gpd.GeoDataFrame(geometry=[line], crs=PROJECT_CRS)
-                    alignment.to_file(alignment_path, driver='GeoJSON')
-                    print("Placeholder alignment created for testing.")
+        # Create a placeholder line for testing purposes
+        print("Creating placeholder alignment line for testing...")
+        # Get the bounds of the site
+        site_bounds_path = DATASET_INFO["Input"]["Site_Bounds"]["path"]
+        if os.path.exists(site_bounds_path):
+            site_bbox = gpd.read_file(site_bounds_path)
+            if not site_bbox.empty:
+                bounds = site_bbox.total_bounds
+                # Create a line that crosses the site
+                from shapely.geometry import LineString
+                line = LineString([
+                    ((bounds[0] + bounds[2]) / 2, bounds[1]),  # Bottom middle
+                    ((bounds[0] + bounds[2]) / 2, bounds[3])   # Top middle
+                ])
+                alignment = gpd.GeoDataFrame(geometry=[line], crs=PROJECT_CRS)
+                alignment.to_file(alignment_path, driver='GeoJSON')
+                print("Placeholder alignment created for testing.")
     
     print(f"Alignment bounds: {alignment.total_bounds}")
     return alignment
 
 def crop_vector_data(site_bbox):
     """
-    Crop vector datasets using site bounding box
+    Crop vector datasets to the site boundary
     
     Parameters:
-    site_bbox (GeoDataFrame): Site bounds for cropping
+    site_bbox (GeoDataFrame): Site boundary polygon
     
     Returns:
-    tuple: Cropped GeoDataFrames (buildings_crop, nsi_crop)
+    tuple: (buildings_crop, nsi_crop, water_crop) cropped GeoDataFrames
     """
-    # Define paths for original and cropped datasets
-    buildings_path = str(DATASET_INFO["Input"]["Buildings"]["path"])
-    nsi_path = str(DATASET_INFO["Input"]["NSI"]["path"])
-    
-    buildings_crop_path = str(DATASET_INFO["Preprocessed"]["Buildings_crop"]["path"])
-    nsi_crop_path = str(DATASET_INFO["Preprocessed"]["NSI_crop"]["path"])
-    
-    # Check if cropped files already exist
-    if (os.path.exists(buildings_crop_path) and 
-        os.path.exists(nsi_crop_path) and 
-        not OVERWRITE["vector_crop"]):
-        print("Cropped vector files already exist, loading them...")
-        buildings_crop = gpd.read_file(buildings_crop_path)
-        nsi_crop = gpd.read_file(nsi_crop_path)
-        
-        # Ensure CRS is set correctly
-        if buildings_crop.crs is None or buildings_crop.crs != PROJECT_CRS:
-            print(f"Ensuring buildings CRS is {PROJECT_CRS}")
-            buildings_crop.crs = PROJECT_CRS
-            buildings_crop.to_file(buildings_crop_path, driver='GeoJSON')
-            
-        if nsi_crop.crs is None or nsi_crop.crs != PROJECT_CRS:
-            print(f"Ensuring NSI CRS is {PROJECT_CRS}")
-            nsi_crop.crs = PROJECT_CRS
-            nsi_crop.to_file(nsi_crop_path, driver='GeoJSON')
-        
-        return buildings_crop, nsi_crop
-    
     print("Cropping vector datasets...")
     
-    # Create spatial index for faster intersection
-    bbox_geom = site_bbox.geometry.unary_union
+    # Crop buildings
+    buildings_path = DATASET_INFO["Input"]["Buildings"]["path"]
+    buildings_crop_path = DATASET_INFO["Preprocessed"]["Buildings_crop"]["path"]
+    buildings_crop = None
     
-    # Crop Buildings
-    print("Cropping Buildings...")
-    buildings = gpd.read_file(buildings_path)
-    # Ensure CRS matches
-    if buildings.crs is None:
-        print(f"Buildings has no CRS, assigning {PROJECT_CRS}")
-        buildings.crs = PROJECT_CRS
-    elif buildings.crs != PROJECT_CRS:
-        print(f"Converting buildings from {buildings.crs} to {PROJECT_CRS}")
-        buildings = buildings.to_crs(PROJECT_CRS)
-    # Perform spatial intersection
-    buildings_crop = buildings[buildings.intersects(bbox_geom)]
-    buildings_crop.to_file(buildings_crop_path, driver='GeoJSON')
+    # Check if buildings crop already exists
+    if os.path.exists(buildings_crop_path) and not OVERWRITE["vector_crop"]:
+        print(f"Buildings crop already exists at {buildings_crop_path}")
+        buildings_crop = gpd.read_file(buildings_crop_path)
+        if buildings_crop.empty:
+            print("Existing buildings crop is empty! Regenerating...")
+        else:
+            print(f"Loaded {len(buildings_crop)} buildings from existing crop")
+            
+    # Create buildings crop if it doesn't exist or is empty
+    if buildings_crop is None or buildings_crop.empty:
+        print(f"Creating buildings crop from {buildings_path}")
+        try:
+            print(f"Reading buildings from {buildings_path}")
+            buildings = gpd.read_file(buildings_path)
+            print(f"Read {len(buildings)} buildings with CRS: {buildings.crs}")
+            
+            if buildings.crs is None:
+                print("WARNING: Buildings GeoJSON has no CRS defined!")
+                print("Assuming the CRS is the same as the project CRS...")
+                buildings.crs = PROJECT_CRS
+            elif buildings.crs != PROJECT_CRS:
+                print(f"Reprojecting buildings from {buildings.crs} to {PROJECT_CRS}")
+                buildings = buildings.to_crs(PROJECT_CRS)
+            
+            # Crop to site boundary
+            print(f"Clipping buildings to site boundary with CRS: {site_bbox.crs}")
+            buildings_crop = gpd.clip(buildings, site_bbox)
+            print(f"Successfully cropped to {len(buildings_crop)} buildings")
+            
+            buildings_crop.to_file(buildings_crop_path)
+            print(f"Saved {len(buildings_crop)} buildings to {buildings_crop_path}")
+        except Exception as e:
+            print(f"Error cropping buildings: {e}")
+            buildings_crop = gpd.GeoDataFrame(geometry=[], crs=PROJECT_CRS)
     
-    # Crop NSI
-    print("Cropping NSI...")
-    nsi = gpd.read_file(nsi_path)
-    # Ensure CRS matches
-    if nsi.crs is None:
-        print(f"NSI has no CRS, assigning {PROJECT_CRS}")
-        nsi.crs = PROJECT_CRS
-    elif nsi.crs != PROJECT_CRS:
-        print(f"Converting NSI from {nsi.crs} to {PROJECT_CRS}")
-        nsi = nsi.to_crs(PROJECT_CRS)
-    # Perform spatial intersection
-    nsi_crop = nsi[nsi.intersects(bbox_geom)]
-    nsi_crop.to_file(nsi_crop_path, driver='GeoJSON')
+    # Crop NSI data
+    nsi_path = DATASET_INFO["Input"]["NSI"]["path"]
+    nsi_crop_path = DATASET_INFO["Preprocessed"]["NSI_crop"]["path"]
+    nsi_crop = None
     
-    return buildings_crop, nsi_crop
+    # Check if NSI crop already exists
+    if os.path.exists(nsi_crop_path) and not OVERWRITE["vector_crop"]:
+        print(f"NSI crop already exists at {nsi_crop_path}")
+        nsi_crop = gpd.read_file(nsi_crop_path)
+        if nsi_crop.empty:
+            print("Existing NSI crop is empty! Regenerating...")
+        else:
+            print(f"Loaded {len(nsi_crop)} NSI points from existing crop")
+            
+    # Create NSI crop if it doesn't exist or is empty
+    if nsi_crop is None or nsi_crop.empty:
+        print(f"Creating NSI crop from {nsi_path}")
+        try:
+            nsi = gpd.read_file(nsi_path)
+            if nsi.crs is None:
+                print("WARNING: NSI GeoJSON has no CRS defined!")
+                print("Assuming the CRS is the same as the project CRS...")
+                nsi.crs = PROJECT_CRS
+            elif nsi.crs != PROJECT_CRS:
+                print(f"Reprojecting NSI from {nsi.crs} to {PROJECT_CRS}")
+                nsi = nsi.to_crs(PROJECT_CRS)
+            
+            # Crop to site boundary
+            nsi_crop = gpd.clip(nsi, site_bbox)
+            nsi_crop.to_file(nsi_crop_path)
+            print(f"Saved {len(nsi_crop)} NSI points to {nsi_crop_path}")
+        except Exception as e:
+            print(f"Error cropping NSI data: {e}")
+            nsi_crop = gpd.GeoDataFrame(geometry=[], crs=PROJECT_CRS)
+    
+    # Crop water polygon
+    water_path = DATASET_INFO["Input"]["Water"]["path"]
+    water_crop_path = DATASET_INFO["Preprocessed"]["Water_crop"]["path"]
+    water_crop = None
+    
+    # Check if water crop already exists
+    if os.path.exists(water_crop_path) and not OVERWRITE["vector_crop"]:
+        print(f"Water crop already exists at {water_crop_path}")
+        water_crop = gpd.read_file(water_crop_path)
+        if water_crop.empty:
+            print("Existing water crop is empty! Regenerating...")
+        else:
+            print(f"Loaded water polygon from existing crop")
+            
+    # Create water crop if it doesn't exist or is empty
+    if water_crop is None or water_crop.empty:
+        print(f"Creating water crop from {water_path}")
+        try:
+            water = gpd.read_file(water_path)
+            if water.crs is None:
+                print("WARNING: Water GeoJSON has no CRS defined!")
+                print("Assuming the CRS is the same as the project CRS...")
+                water.crs = PROJECT_CRS
+            elif water.crs != PROJECT_CRS:
+                print(f"Reprojecting water from {water.crs} to {PROJECT_CRS}")
+                water = water.to_crs(PROJECT_CRS)
+            
+            # Crop to site boundary
+            water_crop = gpd.clip(water, site_bbox)
+            water_crop.to_file(water_crop_path)
+            print(f"Saved water polygon to {water_crop_path}")
+        except Exception as e:
+            print(f"Error cropping water data: {e}")
+            water_crop = gpd.GeoDataFrame(geometry=[], crs=PROJECT_CRS)
+    
+    return buildings_crop, nsi_crop, water_crop
+
+def crop_raster(input_path, output_path, bounds):
+    """
+    Crop a raster to the specified bounds
+    
+    Parameters:
+    input_path (str or Path): Path to input raster
+    output_path (str or Path): Path to output cropped raster
+    bounds (tuple): Bounds in the format (minx, miny, maxx, maxy)
+    
+    Returns:
+    None
+    """
+    print(f"Cropping raster from {input_path} to {output_path}")
+    
+    # Ensure paths are strings
+    input_path = str(input_path)
+    output_path = str(output_path)
+    
+    with rasterio.open(input_path) as src:
+        # Create a window from the bounds
+        window = from_bounds(*bounds, src.transform)
+        
+        # Read the data in the window
+        data = src.read(window=window)
+        
+        # Calculate the transform for the window
+        transform = rasterio.windows.transform(window, src.transform)
+        
+        # Create a profile for the output raster
+        profile = src.profile.copy()
+        profile.update({
+            'height': window.height,
+            'width': window.width,
+            'transform': transform
+        })
+        
+        # Write the cropped raster
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            dst.write(data)
+            
+    print(f"Raster cropped successfully to {output_path}")
 
 def crop_raster_data(site_bbox):
     """
@@ -382,9 +270,8 @@ def crop_raster_data(site_bbox):
     fema_flood_crop_path = str(DATASET_INFO["Preprocessed"]["FEMA_Flood_crop"]["path"])
     
     # Check if cropped files already exist
-    if (os.path.exists(fema_flood_crop_path) and 
-        not OVERWRITE["raster_crop"]):
-        print("Cropped raster files already exist")
+    if os.path.exists(fema_flood_crop_path) and not OVERWRITE["raster_crop"]:
+        print("Cropped FEMA raster file already exists")
         
         # Verify CRS of the cropped raster
         try:
@@ -399,7 +286,7 @@ def crop_raster_data(site_bbox):
             
         return fema_flood_crop_path
     
-    print("Cropping raster datasets...")
+    print("Cropping FEMA raster dataset...")
     
     # Get geometries for cropping
     bbox_geom = [sg.mapping(site_bbox.geometry.unary_union)]
@@ -441,31 +328,506 @@ def crop_raster_data(site_bbox):
     
     return fema_flood_crop_path
 
-def preprocess_data():
+def process_water_polygon(water_gdf, alignment_gdf, site_bbox):
     """
-    Main preprocessing function that runs all preprocessing steps
+    Process water polygon with advanced filtering:
+    1. Crop to site boundary
+    2. Dissolve all pieces into one polygon
+    3. Split with alignment polyline
+    4. Apply filtering logic based on alignment and connectivity
+    
+    Parameters:
+    water_gdf (GeoDataFrame): Water polygons
+    alignment_gdf (GeoDataFrame): Alignment polyline
+    site_bbox (GeoDataFrame): Site boundary
     
     Returns:
-    dict: Dictionary containing all preprocessed datasets
+    GeoDataFrame: Processed and filtered water polygons
     """
-    # Create site bounds if needed
-    site_bbox = create_site_bounds()
+    print("Processing water polygon with advanced filtering...")
     
-    # Create alignment if needed
-    alignment = create_alignment()
+    if water_gdf is None or water_gdf.empty:
+        print("No water polygon data available for processing")
+        return None
     
-    # Crop vector data
-    buildings_crop, nsi_crop = crop_vector_data(site_bbox)
+    if alignment_gdf is None or alignment_gdf.empty:
+        print("No alignment data available for water processing")
+        return water_gdf
     
-    # Crop raster data
-    fema_flood_crop_path = crop_raster_data(site_bbox)
+    # Step 1: Crop water to site boundary
+    print("Cropping water to site boundary...")
+    water_crop = gpd.clip(water_gdf, site_bbox)
+    if water_crop.empty:
+        print("Water polygon is empty after cropping to site boundary")
+        return water_crop
     
+    # Step 2: Dissolve all water pieces into one polygon
+    print("Dissolving water pieces into a single polygon...")
+    water_dissolved = water_crop.dissolve()
+    
+    # Check for validity and fix if needed
+    if not all(water_dissolved.geometry.is_valid):
+        print("Fixing invalid geometries in dissolved water...")
+        water_dissolved.geometry = water_dissolved.geometry.buffer(0)
+    
+    # Step 3: Split the dissolved water using the alignment
+    print("Splitting water with alignment...")
+    
+    # Get the alignment geometry
+    if len(alignment_gdf) > 1:
+        print(f"Combining {len(alignment_gdf)} alignment features...")
+        from shapely.ops import linemerge
+        alignment_geoms = alignment_gdf.geometry.tolist()
+        alignment_line = linemerge(alignment_geoms)
+        if alignment_line.geom_type == 'MultiLineString':
+            print("Warning: Could not merge alignment into a single LineString")
+            # Use the longest piece
+            alignment_line = max(alignment_line.geoms, key=lambda x: x.length)
+    else:
+        alignment_line = alignment_gdf.geometry.iloc[0]
+        # Handle case where even a single alignment feature is actually a MultiLineString
+        if alignment_line.geom_type == 'MultiLineString':
+            print("Warning: Single alignment feature is a MultiLineString")
+            # Use the longest piece
+            alignment_line = max(alignment_line.geoms, key=lambda x: x.length)
+    
+    # Get the water geometry
+    water_geom = water_dissolved.geometry.iloc[0]
+    from shapely.geometry import LineString, Point, MultiPoint, Polygon, MultiPolygon
+    
+    print(f"Alignment type: {alignment_line.geom_type}")
+    print(f"Water geometry type: {water_geom.geom_type}")
+    
+    # Create debug folder
+    debug_folder = "debug_geometries"
+    os.makedirs(debug_folder, exist_ok=True)
+    
+    # Check if they actually intersect
+    if alignment_line.intersects(water_geom):
+        print("DEBUG: Alignment intersects water polygon!")
+        intersection = alignment_line.intersection(water_geom)
+        print(f"Intersection type: {intersection.geom_type}")
+        print(f"Intersection length: {intersection.length if hasattr(intersection, 'length') else 'N/A'}")
+        
+        # Save debug geometries
+        gpd.GeoDataFrame(geometry=[water_geom], crs=water_gdf.crs).to_file(
+            os.path.join(debug_folder, "water_before_split.geojson")
+        )
+        
+        gpd.GeoDataFrame(geometry=[alignment_line], crs=alignment_gdf.crs).to_file(
+            os.path.join(debug_folder, "alignment_for_split.geojson")
+        )
+        
+        gpd.GeoDataFrame(geometry=[intersection], crs=alignment_gdf.crs).to_file(
+            os.path.join(debug_folder, "alignment_water_intersection.geojson")
+        )
+        
+        # Step 3.1: Find entry/exit points of alignment with water boundary
+        try:
+            # Get the boundary of the water polygon
+            water_boundary = water_geom.boundary
+            
+            # Find intersection points between alignment and water boundary
+            boundary_intersection = alignment_line.intersection(water_boundary)
+            
+            # Convert to a list of points
+            if boundary_intersection.geom_type == 'Point':
+                boundary_points = [boundary_intersection]
+            elif boundary_intersection.geom_type == 'MultiPoint':
+                boundary_points = list(boundary_intersection.geoms)
+            else:
+                print(f"Unexpected boundary intersection type: {boundary_intersection.geom_type}")
+                boundary_points = []
+                # Try to extract points from a more complex geometry
+                if hasattr(boundary_intersection, 'geoms'):
+                    for geom in boundary_intersection.geoms:
+                        if geom.geom_type == 'Point':
+                            boundary_points.append(geom)
+                
+            print(f"Found {len(boundary_points)} boundary intersection points")
+            
+            # Save boundary points for debugging
+            if boundary_points:
+                gpd.GeoDataFrame(geometry=boundary_points, crs=alignment_gdf.crs).to_file(
+                    os.path.join(debug_folder, "boundary_intersection_points.geojson")
+                )
+            
+            # If we have an even number of points, we can create segments
+            if len(boundary_points) >= 2:
+                # Group points into entry/exit pairs
+                # If we have ordered points along the alignment, we can create segments
+                boundary_coords = [(p.x, p.y) for p in boundary_points]
+                
+                # We need to order the points along the alignment
+                # This is a bit tricky, so we'll use a distance-based approach
+                
+                # Get all coordinates of the alignment
+                alignment_coords = list(alignment_line.coords)
+                
+                # For each boundary point, find its position along the alignment
+                point_positions = []
+                for point in boundary_points:
+                    min_dist = float('inf')
+                    closest_index = 0
+                    
+                    # Find the closest segment of the alignment
+                    for i in range(len(alignment_coords) - 1):
+                        line_segment = LineString([alignment_coords[i], alignment_coords[i+1]])
+                        dist = point.distance(line_segment)
+                        if dist < min_dist:
+                            min_dist = dist
+                            closest_index = i
+                    
+                    # Record the point and its position
+                    point_positions.append((point, closest_index))
+                
+                # Sort points by their position along the alignment
+                point_positions.sort(key=lambda x: x[1])
+                sorted_boundary_points = [pp[0] for pp in point_positions]
+                
+                # Create segments between consecutive points
+                segments = []
+                for i in range(0, len(sorted_boundary_points), 2):
+                    if i + 1 < len(sorted_boundary_points):  # Ensure we have a pair
+                        segment = LineString([sorted_boundary_points[i], sorted_boundary_points[i+1]])
+                        segments.append(segment)
+                
+                print(f"Created {len(segments)} line segments for splitting")
+                
+                # Save the segments
+                if segments:
+                    gpd.GeoDataFrame(geometry=segments, crs=alignment_gdf.crs).to_file(
+                        os.path.join(debug_folder, "split_segments.geojson")
+                    )
+                
+                # Now use these segments to split the water polygon
+                split_results = water_geom
+                for segment in segments:
+                    try:
+                        from shapely.ops import split
+                        split_results = split(split_results, segment)
+                    except Exception as e:
+                        print(f"Error splitting with segment: {e}")
+                
+                # Check if we successfully split the water
+                if hasattr(split_results, 'geoms') and len(split_results.geoms) > 1:
+                    print(f"Successfully split water into {len(split_results.geoms)} pieces")
+                    
+                    # Save the split result
+                    gpd.GeoDataFrame(geometry=list(split_results.geoms), crs=water_gdf.crs).to_file(
+                        os.path.join(debug_folder, "water_split_result.geojson")
+                    )
+                    
+                    # Create GeoDataFrame from pieces
+                    water_pieces = gpd.GeoDataFrame(
+                        geometry=list(split_results.geoms),
+                        crs=water_gdf.crs
+                    )
+                    
+                    # Apply the filtering logic
+                    # Calculate area for each piece
+                    water_pieces['area'] = water_pieces.geometry.area
+                    
+                    # Find the largest piece
+                    largest_idx = water_pieces['area'].idxmax()
+                    largest_piece = water_pieces.loc[largest_idx, 'geometry']
+                    
+                    # Filter pieces based on the connectivity logic
+                    kept_pieces = [largest_piece]
+                    dropped_pieces = []
+                    
+                    for idx, row in water_pieces.iterrows():
+                        if idx == largest_idx:
+                            continue  # Skip the largest piece
+                        
+                        # Get piece centroid
+                        piece_geom = row.geometry
+                        centroid = piece_geom.centroid
+                        
+                        # Find nearest point on the largest piece
+                        from shapely.ops import nearest_points
+                        nearest_point = nearest_points(centroid, largest_piece)[1]
+                        
+                        # Create line between centroid and nearest point
+                        connection_line = LineString([centroid, nearest_point])
+                        
+                        # Check if alignment intersects this line
+                        if alignment_line.intersects(connection_line):
+                            print(f"Dropping water piece {idx} - alignment blocks connection to largest piece")
+                            dropped_pieces.append(piece_geom)
+                        else:
+                            print(f"Keeping water piece {idx} - connected to largest piece")
+                            kept_pieces.append(piece_geom)
+                    
+                    # Create new GeoDataFrame with only the kept pieces
+                    filtered_water = gpd.GeoDataFrame(
+                        geometry=kept_pieces,
+                        crs=water_gdf.crs
+                    )
+                    
+                    print(f"Kept {len(kept_pieces)} water pieces, dropped {len(dropped_pieces)} pieces")
+                    
+                    # Dissolve if needed
+                    if len(kept_pieces) > 1:
+                        filtered_water = filtered_water.dissolve()
+                        print("Dissolved kept pieces into final water polygon")
+                    
+                    # Save final water polygon
+                    water_crop_path = DATASET_INFO["Preprocessed"]["Water_crop"]["path"]
+                    filtered_water.to_file(water_crop_path)
+                    
+                    return filtered_water
+                else:
+                    print("Segment splitting didn't create multiple pieces")
+            else:
+                print("Not enough boundary intersection points found for splitting")
+                
+            # Fall back to perpendicular line approach if entry/exit approach fails
+            print("Falling back to perpendicular line approach...")
+            
+            # Create a straight line perpendicular to the alignment
+            from shapely.geometry import box
+            import numpy as np
+            
+            # Get the bounds of the water with a buffer
+            minx, miny, maxx, maxy = water_geom.bounds
+            dx = maxx - minx
+            dy = maxy - miny
+            center_x = (minx + maxx) / 2
+            center_y = (miny + maxy) / 2
+            
+            # Create a line aligned with the general direction of the alignment
+            direction_vector = LineString([
+                alignment_line.coords[0],
+                alignment_line.coords[-1]
+            ])
+            
+            angle = np.arctan2(
+                direction_vector.coords[-1][1] - direction_vector.coords[0][1],
+                direction_vector.coords[-1][0] - direction_vector.coords[0][0]
+            )
+            
+            # Create perpendicular line
+            perp_angle = angle + np.pi/2
+            line_length = max(dx, dy) * 2  # Make sure it's long enough
+            
+            perp_line = LineString([
+                (center_x - np.cos(perp_angle) * line_length, 
+                 center_y - np.sin(perp_angle) * line_length),
+                (center_x + np.cos(perp_angle) * line_length,
+                 center_y + np.sin(perp_angle) * line_length)
+            ])
+            
+            # Save the perpendicular line
+            gpd.GeoDataFrame(geometry=[perp_line], crs=alignment_gdf.crs).to_file(
+                os.path.join(debug_folder, "perpendicular_split_line.geojson")
+            )
+            
+            # Try splitting with this line
+            from shapely.ops import split
+            try:
+                final_split = split(water_geom, perp_line)
+                if hasattr(final_split, 'geoms') and len(final_split.geoms) > 1:
+                    print(f"Perpendicular line split water into {len(final_split.geoms)} pieces")
+                    
+                    # Save the split result
+                    gpd.GeoDataFrame(geometry=list(final_split.geoms), crs=water_gdf.crs).to_file(
+                        os.path.join(debug_folder, "water_perpendicular_split.geojson")
+                    )
+                    
+                    # Create GeoDataFrame from pieces
+                    water_pieces = gpd.GeoDataFrame(
+                        geometry=list(final_split.geoms),
+                        crs=water_gdf.crs
+                    )
+                    
+                    # Calculate area for each piece
+                    water_pieces['area'] = water_pieces.geometry.area
+                    
+                    # Find the largest piece
+                    largest_idx = water_pieces['area'].idxmax()
+                    largest_piece = water_pieces.loc[largest_idx, 'geometry']
+                    
+                    # Filter pieces based on the connectivity logic
+                    kept_pieces = [largest_piece]
+                    dropped_pieces = []
+                    
+                    for idx, row in water_pieces.iterrows():
+                        if idx == largest_idx:
+                            continue  # Skip the largest piece
+                        
+                        # Get piece centroid
+                        piece_geom = row.geometry
+                        centroid = piece_geom.centroid
+                        
+                        # Find nearest point on the largest piece
+                        from shapely.ops import nearest_points
+                        nearest_point = nearest_points(centroid, largest_piece)[1]
+                        
+                        # Create line between centroid and nearest point
+                        connection_line = LineString([centroid, nearest_point])
+                        
+                        # Check if alignment intersects this line
+                        if alignment_line.intersects(connection_line):
+                            print(f"Dropping water piece {idx} - alignment blocks connection to largest piece")
+                            dropped_pieces.append(piece_geom)
+                        else:
+                            print(f"Keeping water piece {idx} - connected to largest piece")
+                            kept_pieces.append(piece_geom)
+                    
+                    # Create new GeoDataFrame with only the kept pieces
+                    filtered_water = gpd.GeoDataFrame(
+                        geometry=kept_pieces,
+                        crs=water_gdf.crs
+                    )
+                    
+                    print(f"Kept {len(kept_pieces)} water pieces, dropped {len(dropped_pieces)} pieces")
+                    
+                    # Dissolve if needed
+                    if len(kept_pieces) > 1:
+                        filtered_water = filtered_water.dissolve()
+                        print("Dissolved kept pieces into final water polygon")
+                    
+                    # Save final water polygon
+                    water_crop_path = DATASET_INFO["Preprocessed"]["Water_crop"]["path"]
+                    filtered_water.to_file(water_crop_path)
+                    
+                    return filtered_water
+                else:
+                    print("Perpendicular line splitting also failed")
+            except Exception as e:
+                print(f"Error in perpendicular line splitting: {e}")
+                
+        except Exception as e:
+            print(f"Error in entry/exit point processing: {e}")
+            import traceback
+            traceback.print_exc()
+            
+    else:
+        print("DEBUG: Alignment does NOT intersect water polygon!")
+        print(f"Alignment bounds: {alignment_line.bounds}")
+        print(f"Water bounds: {water_geom.bounds}")
+    
+    # If all approaches fail, just return the cropped water
+    print("All splitting approaches failed. Returning the original cropped water polygon.")
+    water_crop_path = DATASET_INFO["Preprocessed"]["Water_crop"]["path"]
+    water_crop.to_file(water_crop_path)
+    print(f"Saved original cropped water polygon to {water_crop_path}")
+    return water_crop
+
+def preprocess_data():
+    """
+    Preprocess data for flood infrastructure analysis
+    
+    Returns:
+    dict: Dictionary of preprocessed data
+    """
+    print("Starting preprocessing...")
+    
+    # Get project directory for relative paths
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Create output directories if they don't exist
+    for dataset_type in DATASET_INFO:
+        for dataset in DATASET_INFO[dataset_type]:
+            # Check if path exists for this dataset
+            if "path" in DATASET_INFO[dataset_type][dataset]:
+                path = DATASET_INFO[dataset_type][dataset]["path"]
+                # Convert path to absolute path if it's not already
+                if not os.path.isabs(path):
+                    path = os.path.join(project_dir, str(path))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            else:
+                # Skip warning for Webmap entries - they'll be created during webmap generation
+                if dataset_type != "Webmap":
+                    print(f"Warning: No path found for {dataset_type}/{dataset}")
+    
+    # DEBUGGING: Print dataset keys to identify correct structure
+    print("Available dataset types:", DATASET_INFO.keys())
+    for dataset_type in DATASET_INFO:
+        print(f"Datasets in {dataset_type}:", DATASET_INFO[dataset_type].keys())
+    
+    # Create site bounds first since we need it for cropping
+    print("Creating/loading site bounds...")
+    site_bounds = create_site_bounds()
+    
+    # Load the buildings data
+    buildings_path = DATASET_INFO["Input"]["Buildings"]["path"]
+    buildings_gdf = gpd.read_file(buildings_path)
+    print(f"Loaded buildings data from {buildings_path}")
+    
+    # Check CRS and reproject if needed
+    if buildings_gdf.crs != PROJECT_CRS:
+        print(f"Reprojecting buildings from {buildings_gdf.crs} to {PROJECT_CRS}")
+        buildings_gdf = buildings_gdf.to_crs(PROJECT_CRS)
+    
+    # Clip buildings to the site boundary
+    print(f"Clipping buildings to study area... ({len(buildings_gdf)} buildings before clipping)")
+    buildings_gdf = gpd.clip(buildings_gdf, site_bounds)
+    print(f"Buildings clipped to study area. {len(buildings_gdf)} buildings remaining.")
+    
+    # Save cropped buildings to file
+    buildings_crop_path = DATASET_INFO["Preprocessed"]["Buildings_crop"]["path"]
+    buildings_gdf.to_file(buildings_crop_path, driver='GeoJSON')
+    print(f"Saved cropped buildings to {buildings_crop_path}")
+    
+    # Load and process alignment polyline before water processing
+    alignment_gdf = create_alignment()
+    
+    # Load and process water polygon with advanced filtering
+    if "Water" in DATASET_INFO["Input"]:
+        water_path = DATASET_INFO["Input"]["Water"]["path"]
+        if os.path.exists(water_path):
+            water_gdf = gpd.read_file(water_path)
+            
+            # Check if the water has a CRS
+            if water_gdf.crs is None:
+                print(f"Warning: Water has no CRS. Setting to {PROJECT_CRS}")
+                water_gdf.set_crs(PROJECT_CRS, inplace=True)
+            elif water_gdf.crs != PROJECT_CRS:
+                print(f"Reprojecting water from {water_gdf.crs} to {PROJECT_CRS}")
+                water_gdf = water_gdf.to_crs(PROJECT_CRS)
+                
+            # Apply advanced water processing
+            water_gdf = process_water_polygon(water_gdf, alignment_gdf, site_bounds)
+            
+        else:
+            water_gdf = None
+            print(f"Warning: Water polygon file not found at {water_path}")
+    else:
+        water_gdf = None
+        print("Warning: No water polygon path specified in config")
+    
+    # Load NSI data if available
+    if "NSI" in DATASET_INFO["Input"]:
+        nsi_path = DATASET_INFO["Input"]["NSI"]["path"]
+        if os.path.exists(nsi_path):
+            nsi_gdf = gpd.read_file(nsi_path)
+            
+            # Check if the NSI has a CRS
+            if nsi_gdf.crs is None:
+                print(f"Warning: NSI has no CRS. Setting to {PROJECT_CRS}")
+                nsi_gdf.set_crs(PROJECT_CRS, inplace=True)
+            elif nsi_gdf.crs != PROJECT_CRS:
+                print(f"Reprojecting NSI from {nsi_gdf.crs} to {PROJECT_CRS}")
+                nsi_gdf = nsi_gdf.to_crs(PROJECT_CRS)
+        else:
+            nsi_gdf = None
+            print(f"Warning: NSI file not found at {nsi_path}")
+    else:
+        nsi_gdf = None
+        print("Warning: No NSI path specified in config")
+    
+    # Crop FEMA flood raster
+    fema_flood_crop = crop_raster_data(site_bounds)
+    
+    # Return dictionary of preprocessed data
     return {
-        "site_bbox": site_bbox,
-        "alignment": alignment,
-        "buildings_crop": buildings_crop,
-        "nsi_crop": nsi_crop,
-        "fema_flood_crop_path": fema_flood_crop_path
+        "buildings": buildings_gdf,
+        "fema_flood_crop": fema_flood_crop,
+        "alignment": alignment_gdf,
+        "water": water_gdf,
+        "nsi": nsi_gdf
     }
 
 if __name__ == "__main__":

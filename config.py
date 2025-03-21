@@ -19,10 +19,12 @@ WEB_CRS = "EPSG:4326"      # WGS 84, for web mapping
 
 # Processing toggles
 OVERWRITE = {
-    "site_bounds": False,
+    "site_bounds": True,
     "alignment": True,
-    "vector_crop": False,
-    "raster_crop": False,
+    "vector_crop": True,
+    "raster_crop": True,
+    "fema_flood_crop": True,
+    "buildings_flood": True,
     "buildings_scenarios": True,
     "webmap": True
 }
@@ -36,32 +38,32 @@ DATASET_INFO = {
     # Input datasets
     "Input": {
         "Site_Bounds": {
-            "path": INPUT_DIR / "Site_Bounds.dxf",
-            "description": "Site boundary in CAD format (DXF)"
-        },
-        "Site_Bounds_GeoJSON": {
-            "path": INPUT_DIR / "Site_Bounds.geojson",
-            "description": "Site boundary converted to GeoJSON"
+            "path": INPUT_DIR / "site_boundary.geojson",
+            "description": "Site boundary polygon"
         },
         "Alignment": {
-            "path": INPUT_DIR / "alignment.dxf",
-            "description": "Flood protection alignment in CAD format (DXF)"
-        },
-        "Alignment_GeoJSON": {
             "path": INPUT_DIR / "alignment.geojson",
-            "description": "Flood protection alignment converted to GeoJSON"
+            "description": "Flood protection alignment"
         },
         "Buildings": {
-            "path": INPUT_DIR / "Buildings.geojson",
-            "description": "NYC building footprints"
+            "path": INPUT_DIR / "buildings.geojson",
+            "description": "Building footprints"
         },
         "NSI": {
-            "path": INPUT_DIR / "NSI.geojson",
-            "description": "National Structure Inventory data"
+            "path": INPUT_DIR / "nsi.geojson",
+            "description": "National Structure Inventory points"
+        },
+        "Water": {
+            "path": INPUT_DIR / "water.geojson",
+            "description": "Water bodies"
         },
         "FEMA_Flood": {
-            "path": INPUT_DIR / "FEMA_flood.tif",
-            "description": "FEMA flood zones (1=0.2% annual chance, 2=1% annual chance)"
+            "path": INPUT_DIR / "fema_flood.tif",
+            "description": "FEMA flood zones"
+        },
+        "DEM": {
+            "path": INPUT_DIR / "dem.tif",
+            "description": "Digital Elevation Model"
         }
     },
     
@@ -75,13 +77,17 @@ DATASET_INFO = {
             "path": INPUT_DIR / "NSI_crop.geojson",
             "description": "Cropped National Structure Inventory data"
         },
+        "Water_crop": {
+            "path": INPUT_DIR / "Water_crop.geojson",
+            "description": "Cropped water polygon for determining flood direction"
+        },
         "FEMA_Flood_crop": {
             "path": INPUT_DIR / "FEMA_Flood_crop.tif",
             "description": "Clipped FEMA flood zones"
         }
     },
     
-    # Output datasets
+    # Output datasets with unique keys
     "Output": {
         "Buildings_Scenarios": {
             "path": OUTPUT_DIR / "buildings_scenarios.geojson",
@@ -92,37 +98,49 @@ DATASET_INFO = {
             "description": "Clipped FEMA flood zones for existing scenario"
         },
         "FEMA_Flood_crop_trim": {
-            "path": OUTPUT_DIR / "FEMA_flood_crop_trim.tif",
-            "description": "Clipped and trimmed FEMA flood zones for alignment scenario"
+            "path": OUTPUT_DIR / "intermediate/fema_flood_crop_trim.tif",
+            "description": "Trimmed FEMA flood raster (one side of alignment)"
         },
         "FEMA_Flood_crop_web": {
-            "path": OUTPUT_DIR / "FEMA_flood_crop_web.png",
-            "description": "Web-optimized FEMA flood zones for existing scenario"
+            "path": OUTPUT_DIR / "web/fema_flood.png",
+            "description": "FEMA flood raster for web (PNG)"
         },
         "FEMA_Flood_crop_trim_web": {
-            "path": OUTPUT_DIR / "FEMA_flood_crop_trim_web.png",
-            "description": "Web-optimized FEMA flood zones for alignment scenario"
+            "path": OUTPUT_DIR / "web/fema_flood_trim.png",
+            "description": "Trimmed FEMA flood raster for web (PNG)"
         },
         "Webmap": {
             "path": OUTPUT_DIR / "Flood_Protection.html",
             "description": "Interactive web map showing flood protection scenarios"
+        },
+        "DEM_crop": {
+            "path": OUTPUT_DIR / "intermediate/dem_crop.tif",
+            "description": "Cropped DEM raster"
+        },
+        "Buildings_flood": {
+            "path": OUTPUT_DIR / "buildings_flood.geojson",
+            "description": "Buildings with flood exposure"
+        },
+        "Buildings_scenarios": {
+            "path": OUTPUT_DIR / "buildings_scenarios.geojson",
+            "description": "Buildings with flood protection scenarios"
         }
     },
-    
-    # Webmap visualization settings
-    "Webmap": {
-        "FEMA_FloodHaz": {
-            "hex_1pct": "#0000FF",       # Blue for 1% annual chance flood
-            "hex_0_2pct": "#96C4FF",     # Light blue for 0.2% annual chance flood
-            "opacity": 0.6
-        },
-        "Buildings": {
-            "flooded": "#FF0000",        # Red for flooded buildings
-            "not_flooded": "#444444",    # Dark grey for non-flooded buildings
-            "opacity": 0.8
+        
+        # Webmap visualization settings
+        "Webmap": {
+            "FEMA_FloodHaz": {
+                "hex_1pct": "#0000FF",       # Blue for 1% annual chance flood
+                "hex_0_2pct": "#96C4FF",     # Light blue for 0.2% annual chance flood
+                "opacity": 0.6
+            },
+            "Buildings": {
+                "flooded": "#FF0000",        # Red for flooded buildings
+                "not_flooded": "#444444",    # Dark grey for non-flooded buildings
+                "opacity": 0.8
+            }
         }
     }
-}
 
 # Legend styles for webmap
 LEGEND_STYLES = {
@@ -136,7 +154,7 @@ LEGEND_STYLES = {
 
 # Title box style
 TITLE_STYLE = {
-    "container": "position: fixed; top: 10px; left: 50px; z-index:9999; background: white; padding: 10px 20px; border-radius: 10px; font-family: Arial, sans-serif; box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.3);",
+    "container": "position: fixed; top: 10px; left: 10px; z-index:9999; background: white; padding: 10px 20px; border-radius: 10px; font-family: Arial, sans-serif; box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.3);",
     "title": "margin: 0; font-size: 20px; font-weight: bold; color: #333;"
 }
 
@@ -148,7 +166,7 @@ INFO_STYLE = {
 
 # Logo style
 LOGO_STYLE = {
-    "container": "position: fixed; bottom: 10px; left: 10px; z-index:9999; background: white; padding: 5px 10px; border-radius: 5px; font-family: 'Futura', Arial, sans-serif; box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.3);"
+    "container": "position: fixed; top: 100px; left: 10px; z-index:9999; background: white; padding: 5px 10px; border-radius: 5px; font-family: 'Futura', Arial, sans-serif; box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.3);"
 }
 
 # Helper functions for working with colors
@@ -196,3 +214,7 @@ def interpolate_color_with_alpha(t, start_hex, end_hex):
     
     # Convert back to hex with alpha
     return f"#{r:02x}{g:02x}{b:02x}{a:02x}"
+
+# Large polygon handling
+LARGE_POLYGON_THRESHOLD = 10 * 4046.86  # 30 acres in square meters
+POINTS_PER_AREA = 1 / (5 * 4046.86)    # 1 point per 15 acres

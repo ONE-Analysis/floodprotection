@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "split_segments",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::6539" } },
+"features": [
+{ "type": "Feature", "properties": { }, "geometry": { "type": "LineString", "coordinates": [ [ 984025.236883852398023, 182459.215903056930983 ], [ 983554.040548691875301, 182637.8148893211619 ] ] } }
+]
+}
